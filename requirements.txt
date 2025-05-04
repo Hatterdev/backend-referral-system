@@ -1,0 +1,5 @@
+Flask==2.3.3
+requests
+flask-limiter==1.8
+schedule==1.2.0
+python-dotenv

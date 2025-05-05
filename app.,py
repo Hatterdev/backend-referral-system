@@ -1,10 +1,11 @@
-from datetime import datetime
 import os
 import json
 import logging
+from datetime import datetime
 import schedule
 import time
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
@@ -13,6 +14,11 @@ from flask_limiter.util import get_remote_address
 # ========================
 
 app = Flask(__name__)
+CORS(app)
+
+# Inicializa o Limiter após o app
+limiter = Limiter(app=app, key_func=get_remote_address)
+
 logging.basicConfig(level=logging.INFO)
 
 PORT = int(os.environ.get("PORT", 5000))
@@ -31,12 +37,43 @@ def load_data():
     with open(DATA_FILE, "r") as f:
         return json.load(f)
 
+
 def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
+
 def is_valid_address(addr):
     return addr.startswith("0x") and len(addr) == 42
+
+
+def get_referral(referee):
+    db = load_data()
+    return next((item for item in db["referrals"] if item["referee"] == referee), None)
+
+
+def get_referrer_info(referrer):
+    db = load_data()
+
+    total_points = 0
+    total_paid = 0
+    referrals = []
+
+    for ref in db["referrals"]:
+        if ref["referrer"] == referrer:
+            total_points += ref.get("points", 0)
+            referrals.append(ref)
+
+    for paid in db["paid_referrals"]:
+        if paid["referrer"] == referrer:
+            total_paid += paid.get("total_paid", 0)
+
+    return {
+        "total_points": round(total_points, 2),
+        "total_paid": round(total_paid, 2),
+        "total_unpaid": round(total_points - total_paid, 2),
+        "referrals": referrals
+    }
 
 # ========================
 # Backup Automático Diário
@@ -57,7 +94,7 @@ def backup_json_file():
     except Exception as e:
         logging.error(f"Falha ao fazer backup: {e}")
 
-# Agenda o backup diário às 00:00
+
 def start_backup_scheduler():
     schedule.every().day.at("00:00").do(backup_json_file)
     while True:
@@ -82,11 +119,12 @@ def register_referral():
         db["referrals"].append({
             "referrer": address,
             "referee": "",
-            "paid": False
+            "points": 0
         })
         save_data(db)
 
     return jsonify({"message": "Link registrado localmente"}), 200
+
 
 @app.route("/api/use-referral", methods=["POST"])
 @limiter.limit("3/minute")
@@ -104,14 +142,13 @@ def use_referral():
 
     db = load_data()
 
-    # Verifica se já foi indicado por alguém
-    already_referenced = next((item for item in db["referrals"] if item["referee"] == referee), None)
-    if already_referenced:
+    # Verifica se já foi referido por alguém
+    existing = get_referral(referee)
+    if existing:
         return jsonify({"error": "Já foi indicado por outra carteira."}), 400
 
     # Conta número de indicações do referenciador
     total_referrals = sum(1 for item in db["referrals"] if item["referrer"] == referrer)
-
     if total_referrals >= 200:
         return jsonify({"error": "Limite de indicações atingido"}), 400
 
@@ -119,41 +156,97 @@ def use_referral():
     db["referrals"].append({
         "referrer": referrer,
         "referee": referee,
-        "paid": False
+        "points": 0.01,  # Referrer ganha 0.01
+        "last_used": datetime.now().isoformat()
+    })
+
+    # Registrar recompensa para o referee
+    db["referrals"].append({
+        "referrer": "system",
+        "referee": referee,
+        "points": 0.01,
+        "last_used": datetime.now().isoformat()
     })
 
     save_data(db)
 
-    return jsonify({"message": "Indicação registrada!"}), 200
+    return jsonify({
+        "message": "Indicação registrada com sucesso!",
+        "referrer_earned": 0.01,
+        "referee_earned": 0.01
+    }), 200
+
+
+@app.route("/api/use-faucet", methods=["POST"])
+@limiter.limit("5/minute")
+def use_faucet():
+    data = request.get_json()
+    referee = data.get("referee", "").lower()
+    faucet_token = data.get("faucet_token", "")
+
+    if not is_valid_address(referee):
+        return jsonify({"error": "Endereço inválido"}), 400
+
+    if faucet_token != "VALID_FAUCET_USAGE":
+        return jsonify({"error": "Token inválido"}), 401
+
+    db = load_data()
+
+    referral = get_referral(referee)
+
+    if not referral:
+        logging.info(f"Carteira não indicada: {referee} usou faucet")
+        return jsonify({"message": "Faucet usado sem recompensa de indicação"}), 200
+
+    # Adiciona 0.01 OMMV ao referrer
+    referral["points"] = round(referral.get("points", 0) + 0.01, 2)
+    referral["last_used"] = datetime.now().isoformat()
+
+    save_data(db)
+
+    return jsonify({
+        "message": "Faucet usado com sucesso!",
+        "referrer": referral["referrer"],
+        "points_earned": 0.01,
+        "total_points": referral["points"]
+    }), 200
+
 
 @app.route("/api/referral-status/<address>", methods=["GET"])
 def referral_status(address):
     address = address.lower()
-    db = load_data()
-    referrals = [r for r in db["referrals"] if r["referrer"] == address]
-    total = len(referrals)
-    paid = sum(1 for r in referrals if r["paid"])
+    info = get_referrer_info(address)
+
     return jsonify({
-        "total_referrals": total,
-        "paid": paid,
-        "unpaid": total - paid,
-        "referrals": referrals
+        "referrer": address,
+        "total_points": info["total_points"],
+        "total_paid": info["total_paid"],
+        "total_unpaid": info["total_unpaid"],
+        "referrals": info["referrals"]
     }), 200
+
 
 @app.route("/api/payout-list", methods=["GET"])
 def payout_list():
     db = load_data()
-    unpaid = [r for r in db["referrals"] if not r["paid"]]
     multisend_list = []
-    for ref in unpaid:
-        multisend_list.append({"wallet": ref["referrer"], "amount": 5})
-        multisend_list.append({"wallet": ref["referee"], "amount": 5})
+    unpaid_total = 0
+
+    for ref in db["referrals"]:
+        points = ref.get("points", 0)
+        if points > 0:
+            multisend_list.append({
+                "wallet": ref["referrer"],
+                "amount": points
+            })
+            unpaid_total += points
 
     return jsonify({
         "total_people": len(multisend_list),
-        "total_ommv_to_send": sum(item["amount"] for item in multisend_list),
+        "total_ommv_to_send": round(unpaid_total, 2),
         "multisend_list": multisend_list
     }), 200
+
 
 @app.route("/api/mark-paid", methods=["POST"])
 def mark_paid():
@@ -162,25 +255,58 @@ def mark_paid():
         return jsonify({"error": "Não autorizado"}), 401
 
     db = load_data()
-    for ref in db["referrals"]:
-        ref["paid"] = True
 
-    db["paid_referrals"] = db["referrals"]
-    db["referrals"] = []
+    now = datetime.now().isoformat()
+    summary = {}
+
+    for ref in db["referrals"]:
+        referrer = ref["referrer"]
+        points = ref.get("points", 0)
+
+        if points <= 0:
+            continue
+
+        if referrer not in summary:
+            summary[referrer] = 0
+        summary[referrer] += points
+
+        # Zerar pontos no registro original
+        ref["points"] = 0
+
+    # Atualizar ou criar registros em paid_referrals
+    for referrer, amount in summary.items():
+        found = False
+        for paid in db["paid_referrals"]:
+            if paid["referrer"] == referrer:
+                paid["total_paid"] = round(paid.get("total_paid", 0) + amount, 2)
+                paid["last_paid_at"] = now
+                found = True
+                break
+        if not found:
+            db["paid_referrals"].append({
+                "referrer": referrer,
+                "total_paid": amount,
+                "last_paid_at": now
+            })
 
     save_data(db)
-    return jsonify({"message": "Todas as indicações foram marcadas como pagas."}), 200
+
+    return jsonify({
+        "message": "Saldo não pago foi marcado como pago.",
+        "summary": summary
+    }), 200
+
 
 @app.route("/")
 def index():
     return jsonify({"status": "Backend rodando"}), 200
+
 
 # ========================
 # Iniciar Servidor
 # ========================
 
 if __name__ == "__main__":
-    from datetime import datetime
     import threading
 
     # Inicia thread de backup
